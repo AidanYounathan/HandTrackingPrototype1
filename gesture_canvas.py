@@ -7,6 +7,8 @@ import os
 import time
 import math
 from collections import deque
+import numpy as np
+import random
 
 model_path = "gesture_recognizer.task"
 if not os.path.exists(model_path):
@@ -16,6 +18,7 @@ if not os.path.exists(model_path):
         model_path
     )
     print("Done.")
+
 
 options = vision.GestureRecognizerOptions(
     base_options=python.BaseOptions(model_asset_path=model_path),
@@ -66,16 +69,156 @@ GESTURE_LABELS = {
 TIER2_GESTURES = {"Open_Palm", "Closed_Fist"}
 
 
+# ── particle system ────────────────────────────────────────────────────────────
+
+_SS = 4
+
+def _make_canvas(size, draw_fn, blur_sigma=None):
+    s   = size * _SS * 3
+    img = np.zeros((s, s, 3), dtype=np.uint8)
+    draw_fn(img, s // 2, s // 2, size * _SS)
+    cv2.GaussianBlur(img, (0, 0), blur_sigma or _SS * 0.8, img)
+    out = size * 2
+    sm  = cv2.resize(img, (out, out), interpolation=cv2.INTER_AREA)
+    c   = np.zeros((out, out, 4), dtype=np.uint8)
+    c[:, :, :3] = sm
+    c[:, :, 3]  = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+    return c
+
+def _draw_heart(img, cx, cy, r):
+    col = (80, 60, 240)
+    cv2.circle(img, (cx - r // 3, cy - r // 5), r // 2, col, -1)
+    cv2.circle(img, (cx + r // 3, cy - r // 5), r // 2, col, -1)
+    cv2.fillPoly(img, [np.array(
+        [[cx - r//2, cy + r//8], [cx + r//2, cy + r//8], [cx, cy + r*2//3]], np.int32)], col)
+
+def _draw_star(img, cx, cy, r):
+    col = (0, 215, 255)
+    pts = [[int(cx + (r if k % 2 == 0 else int(r * .42)) * math.cos(math.pi * k / 5 - math.pi / 2)),
+            int(cy + (r if k % 2 == 0 else int(r * .42)) * math.sin(math.pi * k / 5 - math.pi / 2))]
+           for k in range(10)]
+    cv2.fillPoly(img, [np.array(pts, np.int32)], col)
+
+def _draw_diamond(img, cx, cy, r):
+    col = (120, 220, 80)
+    cv2.fillPoly(img, [np.array(
+        [[cx, cy - r], [cx + r//2, cy], [cx, cy + r], [cx - r//2, cy]], np.int32)], col)
+
+def _draw_spark(img, cx, cy, r):
+    cv2.circle(img, (cx, cy), max(2, r // 2), (255, 240, 60), -1)
+
+def _draw_tear(img, cx, cy, r):
+    col = (200, 80, 50)
+    cv2.circle(img, (cx, cy - r // 4), r * 2 // 3, col, -1)
+    cv2.fillPoly(img, [np.array(
+        [[cx - r//3, cy + r//8], [cx + r//3, cy + r//8], [cx, cy + r*3//4]], np.int32)], col)
+
+_HEARTS   = [_make_canvas(s, _draw_heart)          for s in (12, 16, 20, 24)]
+_STARS    = [_make_canvas(s, _draw_star)           for s in (10, 14, 18)]
+_DIAMONDS = [_make_canvas(s, _draw_diamond)        for s in (8,  11, 14)]
+_SPARKS   = [_make_canvas(s, _draw_spark, _SS*2.0) for s in (5,   7,  9)]
+_TEARS    = [_make_canvas(s, _draw_tear)           for s in (8,  11, 14)]
+
+def _composite(frame, canvas, cx, cy, alpha):
+    fh, fw = frame.shape[:2]
+    ch, cw = canvas.shape[:2]
+    x1, y1 = cx - cw // 2, cy - ch // 2
+    fx1 = max(0, x1);      fy1 = max(0, y1)
+    fx2 = min(fw, x1 + cw); fy2 = min(fh, y1 + ch)
+    if fx1 >= fx2 or fy1 >= fy2:
+        return
+    sx, sy = fx1 - x1, fy1 - y1
+    roi    = frame[fy1:fy2, fx1:fx2].astype(np.float32)
+    patch  = canvas[sy:sy + (fy2 - fy1), sx:sx + (fx2 - fx1)]
+    a      = patch[:, :, 3:4].astype(np.float32) * (alpha / 255.0)
+    frame[fy1:fy2, fx1:fx2] = np.clip(
+        roi * (1 - a) + patch[:, :, :3].astype(np.float32) * a, 0, 255).astype(np.uint8)
+
+class Particle:
+    __slots__ = ('x', 'y', '_c', 'vx', 'vy', 'life', 'decay', 'gravity', 'scale', 'dscale')
+
+    def __init__(self, x, y, canvas, vx, vy, decay, gravity=60.0, scale=1.0, dscale=0.0):
+        self.x, self.y   = float(x), float(y)
+        self._c          = canvas
+        self.vx, self.vy = float(vx), float(vy)
+        self.life        = 1.0
+        self.decay       = decay
+        self.gravity     = gravity
+        self.scale       = scale
+        self.dscale      = dscale
+
+    def update(self, dt):
+        self.x    += self.vx * dt
+        self.y    += self.vy * dt
+        self.vy   += self.gravity * dt
+        self.life -= self.decay * dt
+        self.scale += self.dscale * dt
+        return self.life > 0.02 and self.scale > 0.05
+
+    def draw(self, frame):
+        c = self._c
+        if abs(self.scale - 1.0) > 0.02:
+            ph, pw = c.shape[:2]
+            c = cv2.resize(c, (max(4, int(pw * self.scale)), max(4, int(ph * self.scale))),
+                           interpolation=cv2.INTER_LINEAR)
+        _composite(frame, c, int(self.x), int(self.y), self.life)
+
+def _spawn_hearts(x, y):
+    for _ in range(6):
+        particles.append(Particle(x, y, random.choice(_HEARTS),
+            vx=random.uniform(-80, 80), vy=random.uniform(-220, -100),
+            decay=0.55, gravity=30, scale=random.uniform(0.8, 1.5)))
+
+def _spawn_stars(x, y):
+    for _ in range(7):
+        a  = random.uniform(0, math.tau)
+        sp = random.uniform(100, 240)
+        particles.append(Particle(x, y, random.choice(_STARS),
+            vx=sp * math.cos(a), vy=sp * math.sin(a) - 40,
+            decay=0.8, gravity=70, scale=random.uniform(0.8, 1.3), dscale=-0.3))
+
+def _spawn_diamonds(x, y):
+    for _ in range(8):
+        a  = random.uniform(0, math.tau)
+        sp = random.uniform(80, 180)
+        particles.append(Particle(x, y, random.choice(_DIAMONDS),
+            vx=sp * math.cos(a), vy=sp * math.sin(a),
+            decay=0.7, gravity=50, scale=random.uniform(0.7, 1.2)))
+
+def _spawn_sparks(x, y):
+    for _ in range(10):
+        a  = random.uniform(0, math.tau)
+        sp = random.uniform(150, 320)
+        particles.append(Particle(x, y, random.choice(_SPARKS),
+            vx=sp * math.cos(a), vy=sp * math.sin(a),
+            decay=1.6, gravity=90, scale=random.uniform(0.9, 1.4)))
+
+def _spawn_tears(x, y):
+    for _ in range(5):
+        particles.append(Particle(x, y, random.choice(_TEARS),
+            vx=random.uniform(-30, 30), vy=random.uniform(-20, 20),
+            decay=0.5, gravity=200, scale=random.uniform(0.8, 1.3)))
+
+_SPAWNERS = {
+    "ILoveYou":    _spawn_hearts,
+    "Thumb_Up":    _spawn_stars,
+    "Victory":     _spawn_diamonds,
+    "Pointing_Up": _spawn_sparks,
+    "Thumb_Down":  _spawn_tears,
+}
 
 
 # ── main loop ──────────────────────────────────────────────────────────────────
 
 HAND_CONNECTIONS = list(mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS)
 
-BURST_COOLDOWN  = 1.5
-frame_count     = 0
-hand_prev_raw   = {}
-hand_burst_time = {}
+BURST_COOLDOWN     = 1.5
+frame_count        = 0
+hand_prev_raw      = {}
+hand_burst_time    = {}
+particles          = []
+hand_gesture_state = {}
+hand_effect_cd     = {}
 
 fps_history     = deque(maxlen=30)
 fps_sum         = 0.0
@@ -114,6 +257,7 @@ while True:
     fps_sum += new_fps
     last_frame_time = now
     fps = fps_sum / len(fps_history)
+    _dt = min(1.0 / max(new_fps, 1.0), 0.05)
     hud = f"{w}x{h}  {fps:.0f} FPS"
     (tw, th), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.7, font_thick)
     cv2.putText(frame, hud, (w - tw - 10, th + 10), cv2.FONT_HERSHEY_SIMPLEX,
@@ -152,6 +296,12 @@ while True:
             px  = int(hand[9].x * w)
             py  = int(hand[9].y * h)
             raw = results.gestures[i][0].category_name if results.gestures[i] else None
+
+            if raw != hand_gesture_state.get(i) and raw in _SPAWNERS:
+                if now - hand_effect_cd.get(i, 0) > 0.8:
+                    _SPAWNERS[raw](px, py)
+                    hand_effect_cd[i] = now
+            hand_gesture_state[i] = raw
 
             if MODE == 1:
                 cv2.putText(frame, "Hand Detected", (px - 60, py - radius - 12),
@@ -220,6 +370,10 @@ while True:
     hint = MODE_HINTS[MODE]
     cv2.putText(frame, hint, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
                 font_scale * 0.65, (130, 130, 130), font_thick)
+
+    particles[:] = [p for p in particles if p.update(_dt)]
+    for p in particles:
+        p.draw(frame)
 
     cv2.imshow("Gesture Canvas", frame)
     key = cv2.waitKey(1) & 0xFF
